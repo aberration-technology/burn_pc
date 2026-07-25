@@ -1,0 +1,24 @@
+[package]
+name = "burn_pc"
+description = "Predictive-coding inference primitives for Burn"
+version = "0.21.8"
+edition = "2024"
+rust-version = "1.92"
+authors = ["mosure <mitchell@mosure.me>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/aberration-technology/burn_pc"
+homepage = "https://github.com/aberration-technology/burn_pc"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1.0"
+burn = { version = "0.21.0", default-features = false, features = ["std", "ndarray"] }
+serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+burn-ndarray = "0.21.0"
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unwrap_used = "warn"
