@@ -72,6 +72,46 @@ pub struct PcTensorUpdate<B: Backend, const D: usize> {
     pub delta_rms: Tensor<B, 1>,
 }
 
+#[derive(Debug, Clone)]
+/// Backend-resident result of a complete predictive-coding inference schedule.
+pub struct PcInferenceResult<B: Backend, const D: usize> {
+    pub latent: Tensor<B, D>,
+    pub last_grad_norm: Tensor<B, 1>,
+    pub last_delta_rms: Tensor<B, 1>,
+    pub steps_run: usize,
+}
+
+/// Runs a complete latent-inference schedule without synchronizing to the host.
+///
+/// The callback computes the local energy gradient for the current latent.
+/// Downstream model code remains responsible for defining that energy.
+pub fn run_pc_inference<B, const D: usize, F>(
+    mut latent: Tensor<B, D>,
+    config: &PcInferenceConfig,
+    mut energy_gradient: F,
+) -> PcInferenceResult<B, D>
+where
+    B: Backend,
+    F: FnMut(Tensor<B, D>) -> Tensor<B, D>,
+{
+    let device = latent.device();
+    let mut last_grad_norm = Tensor::<B, 1>::zeros([1], &device);
+    let mut last_delta_rms = Tensor::<B, 1>::zeros([1], &device);
+    for _ in 0..config.steps {
+        let update =
+            pc_sgd_update_with_metrics(latent.clone(), energy_gradient(latent.clone()), config);
+        latent = update.tensor;
+        last_grad_norm = update.grad_norm;
+        last_delta_rms = update.delta_rms;
+    }
+    PcInferenceResult {
+        latent,
+        last_grad_norm,
+        last_delta_rms,
+        steps_run: config.steps,
+    }
+}
+
 pub fn pc_sgd_update<B: Backend, const D: usize>(
     latent: Tensor<B, D>,
     grad: Tensor<B, D>,
@@ -138,6 +178,21 @@ pub fn diagnostic_scalar_f32<B: Backend>(tensor: Tensor<B, 1>) -> f32 {
         .into_vec::<f32>()
         .expect("scalar tensor");
     values.first().copied().unwrap_or(0.0)
+}
+
+pub mod config {
+    pub use crate::PcInferenceConfig;
+}
+
+pub mod inference {
+    pub use crate::{
+        PcInferenceResult, PcTensorUpdate, pc_sgd_update, pc_sgd_update_with_metrics,
+        run_pc_inference,
+    };
+}
+
+pub mod metrics {
+    pub use crate::{PcInferenceMetrics, diagnostic_scalar_f32, tensor_l2_norm, tensor_rms};
 }
 
 #[cfg(test)]
@@ -211,6 +266,24 @@ mod tests {
             .into_vec::<f32>()
             .expect("updated latent");
         assert_eq!(values, vec![1.75, -3.5]);
+    }
+
+    #[test]
+    fn multi_step_inference_descends_quadratic_energy() {
+        let device = Default::default();
+        let latent = Tensor::<TestBackend, 1>::from_floats([2.0, -4.0], &device);
+        let config = PcInferenceConfig {
+            steps: 8,
+            step_size: 0.1,
+            max_grad_norm: None,
+            ..PcInferenceConfig::default()
+        };
+        let before = diagnostic_scalar_f32(latent.clone().powf_scalar(2.0).mean());
+        let result = run_pc_inference(latent, &config, |state| state.mul_scalar(2.0));
+        let after = diagnostic_scalar_f32(result.latent.powf_scalar(2.0).mean());
+
+        assert_eq!(result.steps_run, 8);
+        assert!(after < before * 0.04, "after={after} before={before}");
     }
 
     #[test]
