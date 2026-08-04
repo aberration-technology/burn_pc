@@ -1,5 +1,20 @@
 #![forbid(unsafe_code)]
 
+pub mod graph;
+pub mod learning;
+pub mod optimizer;
+pub mod schedule;
+pub mod testkit;
+
+pub use graph::{PcFactorId, PcFactorSpec, PcGraphSpec, PcNodeId, PcNodeSpec};
+pub use learning::{PcLinearFactorDerivatives, activity_energy_gradient, linear_gaussian_factor};
+pub use optimizer::{
+    PcParameterOptimizerConfig, PcParameterOptimizerKind, PcParameterOptimizerState,
+    PcParameterUpdate, pc_parameter_update,
+};
+pub use schedule::{PcLearningSchedule, PcSchedulePhase, PcSchedulePlan};
+pub use testkit::{DerivativeCheck, central_difference};
+
 use anyhow::{Result, anyhow};
 use burn::tensor::Tensor;
 use burn::tensor::backend::Backend;
@@ -8,14 +23,17 @@ use serde::{Deserialize, Serialize};
 /// Geometry used to normalize independent latent corrections.
 ///
 /// `PerSample` keeps one clipping norm for every leading batch element and is
-/// invariant to batch replication. `Global` is retained for experiments that
-/// intentionally couple every element of a latent tensor.
+/// invariant to batch replication. `PerRow` treats the final axis as features
+/// and every leading-axis position as an independent observation, which is the
+/// appropriate geometry for token activities. `Global` is retained for
+/// experiments that intentionally couple every element of a latent tensor.
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PcGradientNormScope {
     Global,
     #[default]
     PerSample,
+    PerRow,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
@@ -195,22 +213,40 @@ pub fn pc_sgd_update_with_metrics<B: Backend, const D: usize>(
 ///
 /// The returned tensor has rank `D`. Global geometry has shape `[1; D]`;
 /// per-sample geometry has the input batch extent on axis zero and singleton
-/// extents on every remaining axis.
+/// extents on every remaining axis; per-row geometry preserves every leading
+/// axis and uses a singleton final axis.
 pub fn tensor_l2_norms<B: Backend, const D: usize>(
     tensor: Tensor<B, D>,
     scope: PcGradientNormScope,
     eps: f32,
 ) -> Tensor<B, D> {
     let dims = tensor.shape().dims::<D>();
-    let batch = dims[0];
-    let features = dims[1..].iter().copied().product::<usize>();
-    let squares = tensor.reshape([batch, features]).powf_scalar(2.0);
     match scope {
-        PcGradientNormScope::Global => squares.sum().reshape([1; D]),
+        PcGradientNormScope::Global => tensor.powf_scalar(2.0).sum().reshape([1; D]),
         PcGradientNormScope::PerSample => {
+            let batch = dims[0];
+            let features = dims[1..].iter().copied().product::<usize>();
             let mut norm_shape = [1; D];
             norm_shape[0] = batch;
-            squares.sum_dim(1).reshape(norm_shape)
+            tensor
+                .reshape([batch, features])
+                .powf_scalar(2.0)
+                .sum_dim(1)
+                .reshape(norm_shape)
+        }
+        PcGradientNormScope::PerRow => {
+            let rows = dims[..D.saturating_sub(1)]
+                .iter()
+                .copied()
+                .product::<usize>();
+            let width = dims[D - 1];
+            let mut norm_shape = dims;
+            norm_shape[D - 1] = 1;
+            tensor
+                .reshape([rows, width])
+                .powf_scalar(2.0)
+                .sum_dim(1)
+                .reshape(norm_shape)
         }
     }
     .sqrt()
@@ -239,6 +275,8 @@ pub fn diagnostic_scalar_f32<B: Backend>(tensor: Tensor<B, 1>) -> f32 {
 }
 
 pub mod config {
+    pub use crate::optimizer::{PcParameterOptimizerConfig, PcParameterOptimizerKind};
+    pub use crate::schedule::PcLearningSchedule;
     pub use crate::{PcGradientNormScope, PcInferenceConfig};
 }
 
@@ -252,6 +290,23 @@ pub mod inference {
 pub mod metrics {
     pub use crate::{
         PcInferenceMetrics, diagnostic_scalar_f32, tensor_l2_norm, tensor_l2_norms, tensor_rms,
+    };
+}
+
+pub mod prelude {
+    pub use crate::graph::{PcFactorId, PcFactorSpec, PcGraphSpec, PcNodeId, PcNodeSpec};
+    pub use crate::learning::{
+        PcLinearFactorDerivatives, activity_energy_gradient, linear_gaussian_factor,
+    };
+    pub use crate::optimizer::{
+        PcParameterOptimizerConfig, PcParameterOptimizerKind, PcParameterOptimizerState,
+        PcParameterUpdate, pc_parameter_update,
+    };
+    pub use crate::schedule::{PcLearningSchedule, PcSchedulePhase, PcSchedulePlan};
+    pub use crate::testkit::{DerivativeCheck, central_difference};
+    pub use crate::{
+        PcGradientNormScope, PcInferenceConfig, PcInferenceMetrics, PcInferenceResult,
+        PcTensorUpdate, run_pc_inference,
     };
 }
 
@@ -371,6 +426,41 @@ mod tests {
         assert!((mean - 7.5).abs() <= 1.0e-5, "mean={mean}");
         assert!((max - 10.0).abs() <= 1.0e-5, "max={max}");
         assert!((clipped - 0.5).abs() <= 1.0e-5, "clipped={clipped}");
+    }
+
+    #[test]
+    fn per_row_clipping_keeps_token_updates_independent() {
+        let device = Default::default();
+        let grad = Tensor::<TestBackend, 3>::from_floats(
+            [[[3.0, 4.0], [6.0, 8.0]], [[0.0, 5.0], [5.0, 12.0]]],
+            &device,
+        );
+        let config = PcInferenceConfig {
+            step_size: 1.0,
+            max_grad_norm: Some(5.0),
+            gradient_norm_scope: PcGradientNormScope::PerRow,
+            eps: 1.0e-8,
+            ..PcInferenceConfig::default()
+        };
+        let update = pc_sgd_update(Tensor::zeros([2, 2, 2], &device), grad, &config)
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("per-row update");
+
+        let expected = [
+            -3.0,
+            -4.0,
+            -3.0,
+            -4.0,
+            0.0,
+            -5.0,
+            -25.0 / 13.0,
+            -60.0 / 13.0,
+        ];
+        for (actual, expected) in update.into_iter().zip(expected) {
+            assert!((actual - expected).abs() < 1.0e-6);
+        }
     }
 
     #[test]
