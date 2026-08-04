@@ -44,6 +44,13 @@ fn infer<B: Backend, const D: usize>(latent: Tensor<B, D>) -> Tensor<B, D> {
 helper is intentionally separate because it synchronizes the selected backend.
 The normal dependency does not force a concrete Burn backend.
 
+Gradient clipping is per sample by default, so repeating a batch does not
+change an individual latent correction. `PcGradientNormScope::Global` remains
+available as an explicit coupled control. The metrics update API also exposes
+the clipping-group mean, maximum, and clipped fraction as backend-resident
+tensors; reading them on the host is intentionally left to downstream logging
+cadence.
+
 The primary use in `burn_dragon` is an experimental recurrent-state inference step before normal
 TBPTT weight-gradient updates. The state correction is an ablation for shorter effective credit
 chains and should remain optional.

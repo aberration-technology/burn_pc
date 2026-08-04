@@ -5,6 +5,19 @@ use burn::tensor::Tensor;
 use burn::tensor::backend::Backend;
 use serde::{Deserialize, Serialize};
 
+/// Geometry used to normalize independent latent corrections.
+///
+/// `PerSample` keeps one clipping norm for every leading batch element and is
+/// invariant to batch replication. `Global` is retained for experiments that
+/// intentionally couple every element of a latent tensor.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PcGradientNormScope {
+    Global,
+    #[default]
+    PerSample,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct PcInferenceConfig {
@@ -12,6 +25,7 @@ pub struct PcInferenceConfig {
     pub step_size: f32,
     pub latent_decay: f32,
     pub max_grad_norm: Option<f32>,
+    pub gradient_norm_scope: PcGradientNormScope,
     pub eps: f32,
 }
 
@@ -22,6 +36,7 @@ impl Default for PcInferenceConfig {
             step_size: 0.03,
             latent_decay: 0.0,
             max_grad_norm: Some(1.0),
+            gradient_norm_scope: PcGradientNormScope::PerSample,
             eps: 1.0e-8,
         }
     }
@@ -58,6 +73,7 @@ pub struct PcInferenceMetrics {
     pub grad_norm_mean: Option<f64>,
     pub grad_norm_max: Option<f64>,
     pub delta_rms_mean: Option<f64>,
+    pub clip_fraction_mean: Option<f64>,
     pub steps_run: usize,
     pub chunks_seen: usize,
     pub chunks_corrected: usize,
@@ -68,8 +84,13 @@ pub struct PcInferenceMetrics {
 #[derive(Debug, Clone)]
 pub struct PcTensorUpdate<B: Backend, const D: usize> {
     pub tensor: Tensor<B, D>,
+    /// Mean clipping-group gradient norm.
     pub grad_norm: Tensor<B, 1>,
+    /// Maximum clipping-group gradient norm.
+    pub grad_norm_max: Tensor<B, 1>,
     pub delta_rms: Tensor<B, 1>,
+    /// Fraction of clipping groups whose norm exceeded the configured limit.
+    pub clip_fraction: Tensor<B, 1>,
 }
 
 #[derive(Debug, Clone)]
@@ -118,13 +139,13 @@ pub fn pc_sgd_update<B: Backend, const D: usize>(
     config: &PcInferenceConfig,
 ) -> Tensor<B, D> {
     let clipped_grad = if let Some(max_grad_norm) = config.max_grad_norm {
-        let grad_norm = tensor_l2_norm(grad.clone(), config.eps);
+        let grad_norm = tensor_l2_norms(grad.clone(), config.gradient_norm_scope, config.eps);
         let scale = grad_norm
-            .add_scalar(config.eps)
+            .clamp_min(config.eps)
             .recip()
             .mul_scalar(max_grad_norm)
             .clamp_max(1.0);
-        grad * scale.reshape([1; D])
+        grad * scale
     } else {
         grad
     };
@@ -137,15 +158,15 @@ pub fn pc_sgd_update_with_metrics<B: Backend, const D: usize>(
     grad: Tensor<B, D>,
     config: &PcInferenceConfig,
 ) -> PcTensorUpdate<B, D> {
-    let grad_norm = tensor_l2_norm(grad.clone(), config.eps);
+    let grad_norms = tensor_l2_norms(grad.clone(), config.gradient_norm_scope, config.eps);
     let clipped_grad = if let Some(max_grad_norm) = config.max_grad_norm {
-        let scale = grad_norm
+        let scale = grad_norms
             .clone()
-            .add_scalar(config.eps)
+            .clamp_min(config.eps)
             .recip()
             .mul_scalar(max_grad_norm)
             .clamp_max(1.0);
-        grad.clone() * scale.reshape([1; D])
+        grad.clone() * scale
     } else {
         grad.clone()
     };
@@ -154,17 +175,54 @@ pub fn pc_sgd_update_with_metrics<B: Backend, const D: usize>(
     let tensor = latent.mul_scalar(decay_scale) + delta.clone();
     PcTensorUpdate {
         tensor,
-        grad_norm,
+        grad_norm: grad_norms.clone().mean().reshape([1]),
+        grad_norm_max: grad_norms.clone().max(),
         delta_rms: tensor_rms(delta, config.eps),
+        clip_fraction: config.max_grad_norm.map_or_else(
+            || Tensor::<B, 1>::zeros([1], &grad.device()),
+            |max_grad_norm| {
+                grad_norms
+                    .greater_elem(max_grad_norm)
+                    .float()
+                    .mean()
+                    .reshape([1])
+            },
+        ),
     }
 }
 
+/// Computes clipping-group L2 norms while preserving broadcastable axes.
+///
+/// The returned tensor has rank `D`. Global geometry has shape `[1; D]`;
+/// per-sample geometry has the input batch extent on axis zero and singleton
+/// extents on every remaining axis.
+pub fn tensor_l2_norms<B: Backend, const D: usize>(
+    tensor: Tensor<B, D>,
+    scope: PcGradientNormScope,
+    eps: f32,
+) -> Tensor<B, D> {
+    let dims = tensor.shape().dims::<D>();
+    let batch = dims[0];
+    let features = dims[1..].iter().copied().product::<usize>();
+    let squares = tensor.reshape([batch, features]).powf_scalar(2.0);
+    match scope {
+        PcGradientNormScope::Global => squares.sum().reshape([1; D]),
+        PcGradientNormScope::PerSample => {
+            let mut norm_shape = [1; D];
+            norm_shape[0] = batch;
+            squares.sum_dim(1).reshape(norm_shape)
+        }
+    }
+    .sqrt()
+    .clamp_min(eps)
+}
+
 pub fn tensor_l2_norm<B: Backend, const D: usize>(tensor: Tensor<B, D>, eps: f32) -> Tensor<B, 1> {
-    tensor.powf_scalar(2.0).sum().add_scalar(eps).sqrt()
+    tensor.powf_scalar(2.0).sum().sqrt().clamp_min(eps)
 }
 
 pub fn tensor_rms<B: Backend, const D: usize>(tensor: Tensor<B, D>, eps: f32) -> Tensor<B, 1> {
-    tensor.powf_scalar(2.0).mean().add_scalar(eps).sqrt()
+    tensor.powf_scalar(2.0).mean().sqrt().clamp_min(eps)
 }
 
 /// Copies one scalar tensor to the host for diagnostics.
@@ -181,7 +239,7 @@ pub fn diagnostic_scalar_f32<B: Backend>(tensor: Tensor<B, 1>) -> f32 {
 }
 
 pub mod config {
-    pub use crate::PcInferenceConfig;
+    pub use crate::{PcGradientNormScope, PcInferenceConfig};
 }
 
 pub mod inference {
@@ -192,7 +250,9 @@ pub mod inference {
 }
 
 pub mod metrics {
-    pub use crate::{PcInferenceMetrics, diagnostic_scalar_f32, tensor_l2_norm, tensor_rms};
+    pub use crate::{
+        PcInferenceMetrics, diagnostic_scalar_f32, tensor_l2_norm, tensor_l2_norms, tensor_rms,
+    };
 }
 
 #[cfg(test)]
@@ -236,6 +296,7 @@ mod tests {
         let config = PcInferenceConfig {
             step_size: 1.0,
             max_grad_norm: Some(1.0),
+            gradient_norm_scope: PcGradientNormScope::Global,
             eps: 1.0e-8,
             ..PcInferenceConfig::default()
         };
@@ -245,6 +306,115 @@ mod tests {
             rms <= 0.51,
             "clipped delta rms should be bounded, got {rms}"
         );
+    }
+
+    #[test]
+    fn per_sample_clipping_is_invariant_to_batch_replication() {
+        let device = Default::default();
+        let config = PcInferenceConfig {
+            step_size: 1.0,
+            max_grad_norm: Some(5.0),
+            gradient_norm_scope: PcGradientNormScope::PerSample,
+            eps: 1.0e-8,
+            ..PcInferenceConfig::default()
+        };
+        let two_rows = Tensor::<TestBackend, 2>::from_floats([[3.0, 4.0], [6.0, 8.0]], &device);
+        let four_rows = Tensor::<TestBackend, 2>::from_floats(
+            [[3.0, 4.0], [6.0, 8.0], [3.0, 4.0], [6.0, 8.0]],
+            &device,
+        );
+
+        let two = pc_sgd_update(
+            Tensor::<TestBackend, 2>::zeros([2, 2], &device),
+            two_rows,
+            &config,
+        )
+        .to_data()
+        .convert::<f32>()
+        .into_vec::<f32>()
+        .expect("two-row update");
+        let four = pc_sgd_update(
+            Tensor::<TestBackend, 2>::zeros([4, 2], &device),
+            four_rows,
+            &config,
+        )
+        .to_data()
+        .convert::<f32>()
+        .into_vec::<f32>()
+        .expect("four-row update");
+
+        assert_eq!(&four[..two.len()], two.as_slice());
+        assert_eq!(&four[two.len()..], two.as_slice());
+        assert_eq!(two, vec![-3.0, -4.0, -3.0, -4.0]);
+    }
+
+    #[test]
+    fn grouped_metrics_report_mean_max_and_clip_fraction() {
+        let device = Default::default();
+        let grad = Tensor::<TestBackend, 2>::from_floats([[3.0, 4.0], [6.0, 8.0]], &device);
+        let config = PcInferenceConfig {
+            step_size: 1.0,
+            max_grad_norm: Some(5.0),
+            gradient_norm_scope: PcGradientNormScope::PerSample,
+            eps: 1.0e-8,
+            ..PcInferenceConfig::default()
+        };
+        let update = pc_sgd_update_with_metrics(
+            Tensor::<TestBackend, 2>::zeros([2, 2], &device),
+            grad,
+            &config,
+        );
+
+        let mean = diagnostic_scalar_f32(update.grad_norm);
+        let max = diagnostic_scalar_f32(update.grad_norm_max);
+        let clipped = diagnostic_scalar_f32(update.clip_fraction);
+        assert!((mean - 7.5).abs() <= 1.0e-5, "mean={mean}");
+        assert!((max - 10.0).abs() <= 1.0e-5, "max={max}");
+        assert!((clipped - 0.5).abs() <= 1.0e-5, "clipped={clipped}");
+    }
+
+    #[test]
+    fn diagnostic_norms_do_not_hide_small_nonzero_updates() {
+        let device = Default::default();
+        let values =
+            Tensor::<TestBackend, 2>::from_floats([[1.0e-6, -1.0e-6], [1.0e-6, -1.0e-6]], &device);
+
+        let rms = diagnostic_scalar_f32(tensor_rms(values.clone(), 1.0e-8));
+        let norms = tensor_l2_norms(values, PcGradientNormScope::PerSample, 1.0e-8)
+            .reshape([2])
+            .to_data()
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .expect("per-sample norms");
+
+        assert!((rms - 1.0e-6).abs() <= 1.0e-9, "rms={rms}");
+        for norm in norms {
+            assert!((norm - 2.0_f32.sqrt() * 1.0e-6).abs() <= 1.0e-9);
+        }
+    }
+
+    #[test]
+    fn global_clipping_remains_an_explicit_control() {
+        let device = Default::default();
+        let grad = Tensor::<TestBackend, 2>::from_floats([[3.0, 4.0], [6.0, 8.0]], &device);
+        let config = PcInferenceConfig {
+            step_size: 1.0,
+            max_grad_norm: Some(5.0),
+            gradient_norm_scope: PcGradientNormScope::Global,
+            eps: 1.0e-8,
+            ..PcInferenceConfig::default()
+        };
+        let update = pc_sgd_update(
+            Tensor::<TestBackend, 2>::zeros([2, 2], &device),
+            grad,
+            &config,
+        )
+        .to_data()
+        .convert::<f32>()
+        .into_vec::<f32>()
+        .expect("global update");
+
+        assert!(update[0].abs() < 3.0, "global clipping must couple rows");
     }
 
     #[test]
