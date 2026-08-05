@@ -1,11 +1,16 @@
 #![forbid(unsafe_code)]
 
+pub mod context;
 pub mod graph;
 pub mod learning;
 pub mod optimizer;
 pub mod schedule;
 pub mod testkit;
 
+pub use context::{
+    PredictiveContextBank, PredictiveContextBankConfig, PredictiveContextCalibration,
+    PredictiveContextCandidate, PredictiveContextNoveltyGate, PredictiveContextSelection,
+};
 pub use graph::{PcFactorId, PcFactorSpec, PcGraphSpec, PcNodeId, PcNodeSpec};
 pub use learning::{PcLinearFactorDerivatives, activity_energy_gradient, linear_gaussian_factor};
 pub use optimizer::{
