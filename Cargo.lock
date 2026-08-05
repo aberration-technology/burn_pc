@@ -638,6 +638,7 @@ dependencies = [
  "burn-ndarray",
  "criterion",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -1,8 +1,8 @@
 use burn::tensor::Tensor;
 use burn_ndarray::NdArray;
 use burn_pc::{
-    PcInferenceConfig, PcParameterOptimizerConfig, linear_gaussian_factor, pc_parameter_update,
-    run_pc_inference,
+    PcInferenceConfig, PcParameterOptimizerConfig, PredictiveContextBank,
+    PredictiveContextBankConfig, linear_gaussian_factor, pc_parameter_update, run_pc_inference,
 };
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
@@ -61,5 +61,35 @@ fn bench_local_learning(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_inference, bench_local_learning);
+fn bench_context_routing(c: &mut Criterion) {
+    for contexts in [8, 64] {
+        let mut bank = PredictiveContextBank::new(PredictiveContextBankConfig {
+            max_contexts: contexts,
+            minimum_observations: 1,
+            ..PredictiveContextBankConfig::default()
+        })
+        .expect("valid context benchmark");
+        for context in 0..contexts {
+            assert_eq!(bank.create().expect("benchmark context"), context);
+            bank.observe(context, 0.1 + context as f64 * 0.01)
+                .expect("benchmark calibration");
+        }
+        let losses = (0..contexts)
+            .map(|context| 0.2 + context as f64 * 0.01)
+            .collect::<Vec<_>>();
+        c.bench_function(&format!("pc/context_select_{contexts}"), |b| {
+            b.iter(|| {
+                bank.select(black_box(&losses), false)
+                    .expect("benchmark selection")
+            })
+        });
+    }
+}
+
+criterion_group!(
+    benches,
+    bench_inference,
+    bench_local_learning,
+    bench_context_routing
+);
 criterion_main!(benches);
