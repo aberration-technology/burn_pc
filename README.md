@@ -57,3 +57,17 @@ Absolute predictive loss chooses the expert, calibrated per-expert envelopes
 detect novelty, and `PredictiveContextNoveltyGate` prevents one transient loss
 spike from allocating a permanent context. Read-only selection does not mutate
 either calibration or novelty state.
+
+Contexts have stable `(slot, generation)` identities. A bounded bank can reject
+new contexts or replace the least-recently-used slot; replacement increments the
+generation so delayed updates cannot be committed to a different context that
+later occupied the same slot. Selection, observation, explicit `touch`, and
+merge decisions all validate that identity. The checkpoint schema persists
+calibration, novelty confirmation, use order, generation, and lifecycle state,
+and still accepts the previous schema with deterministic defaults.
+
+Context merging is deliberately conservative. A downstream scorer must pass the
+same acceptance predicate in both directions before two experts are considered
+equivalent. `burn_pc` owns this state machine and its invariants, but not the
+model-specific loss probe, sparse mask, optimizer collection, or distributed
+update codec.

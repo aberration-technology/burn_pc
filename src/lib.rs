@@ -8,8 +8,10 @@ pub mod schedule;
 pub mod testkit;
 
 pub use context::{
-    PredictiveContextBank, PredictiveContextBankConfig, PredictiveContextCalibration,
-    PredictiveContextCandidate, PredictiveContextNoveltyGate, PredictiveContextSelection,
+    PredictiveContextAllocation, PredictiveContextBank, PredictiveContextBankConfig,
+    PredictiveContextCalibration, PredictiveContextCandidate, PredictiveContextCapacityPolicy,
+    PredictiveContextIdentity, PredictiveContextLifecycle, PredictiveContextMergeConfig,
+    PredictiveContextMergeEvidence, PredictiveContextNoveltyGate, PredictiveContextSelection,
 };
 pub use graph::{PcFactorId, PcFactorSpec, PcGraphSpec, PcNodeId, PcNodeSpec};
 pub use learning::{PcLinearFactorDerivatives, activity_energy_gradient, linear_gaussian_factor};
