@@ -509,6 +509,57 @@ impl PredictiveContextBank {
         })
     }
 
+    /// Test whether an unallocated reserve expert is competitive with the
+    /// best existing expert on the same causal observation.
+    ///
+    /// Absolute loss drift alone is not sufficient evidence for allocating a
+    /// context: over a long stationary stream, a fixed novelty envelope will
+    /// eventually see an outlier. The reserve is a counterfactual control. If
+    /// the best trained expert beats it by more than that expert's calibrated
+    /// loss scale, the observation remains attributable to existing capacity.
+    /// Otherwise, the reserve supports the bank's independent novelty signal.
+    pub fn reserve_supports_novelty(
+        &self,
+        selection: &PredictiveContextSelection,
+        reserve_loss: f64,
+    ) -> Result<bool, String> {
+        if reserve_loss < 0.0 || !reserve_loss.is_finite() {
+            return Err("predictive context reserve loss must be finite and >= 0".to_string());
+        }
+        if selection.candidates.len() != self.calibrations.len() {
+            return Err(format!(
+                "predictive context reserve candidate count {} does not match known context count {}",
+                selection.candidates.len(),
+                self.calibrations.len()
+            ));
+        }
+        if selection
+            .candidates
+            .iter()
+            .enumerate()
+            .any(|(expected, candidate)| {
+                candidate.context_index != expected
+                    || candidate.loss < 0.0
+                    || !candidate.loss.is_finite()
+            })
+        {
+            return Err(
+                "predictive context reserve candidates are not a valid bank selection".to_string(),
+            );
+        }
+        if !selection.novel_evidence || selection.candidates.is_empty() {
+            return Ok(false);
+        }
+        let best = selection
+            .candidates
+            .iter()
+            .min_by(|left, right| left.loss.total_cmp(&right.loss))
+            .expect("non-empty predictive context candidates");
+        let calibration = self.calibrations[best.context_index];
+        let familiar_advantage = calibration.loss_scale(self.config.minimum_loss_scale);
+        Ok(reserve_loss <= best.loss + familiar_advantage)
+    }
+
     pub fn create(&mut self) -> Result<usize, String> {
         let selection = if self.calibrations.len() < self.config.max_contexts {
             PredictiveContextSelection {
@@ -737,6 +788,28 @@ mod tests {
             .select(&[0.3, 1.9], false)
             .expect("predictive selection");
         assert_eq!(selection.context_index, 0);
+    }
+
+    #[test]
+    fn reserve_control_rejects_stationary_outliers_and_accepts_parity() {
+        let mut bank = PredictiveContextBank::new(config()).expect("valid bank");
+        bank.create().expect("context");
+        mature(&mut bank, 0, 0.1);
+        let selection = bank.select(&[0.8], true).expect("novel envelope event");
+        assert!(selection.novel_evidence);
+
+        assert!(
+            !bank
+                .reserve_supports_novelty(&selection, 1.1)
+                .expect("valid reserve loss"),
+            "an existing expert with a clear paired advantage should retain the sample"
+        );
+        assert!(
+            bank.reserve_supports_novelty(&selection, 0.81)
+                .expect("valid reserve loss"),
+            "a reserve expert at predictive parity should support novelty"
+        );
+        assert!(bank.reserve_supports_novelty(&selection, f64::NAN).is_err());
     }
 
     #[test]
