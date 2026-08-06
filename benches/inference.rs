@@ -83,6 +83,17 @@ fn bench_context_routing(c: &mut Criterion) {
                     .expect("benchmark selection")
             })
         });
+
+        let novel_losses = vec![1.0; contexts];
+        let selection = bank
+            .select(&novel_losses, true)
+            .expect("benchmark novelty selection");
+        c.bench_function(&format!("pc/context_reserve_gate_{contexts}"), |b| {
+            b.iter(|| {
+                bank.reserve_supports_novelty(black_box(&selection), black_box(1.01))
+                    .expect("benchmark reserve gate")
+            })
+        });
     }
 }
 

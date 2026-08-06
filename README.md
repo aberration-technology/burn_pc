@@ -58,6 +58,12 @@ detect novelty, and `PredictiveContextNoveltyGate` prevents one transient loss
 spike from allocating a permanent context. Read-only selection does not mutate
 either calibration or novelty state.
 
+Long-running routers can also score one deterministic, unallocated reserve
+expert and call `PredictiveContextBank::reserve_supports_novelty`. This paired
+counterfactual rejects an absolute-loss outlier when a trained expert still has
+a calibrated predictive advantage. The extra model evaluation is downstream
+and only needed after the ordinary bank has already suspected novelty.
+
 Contexts have stable `(slot, generation)` identities. A bounded bank can reject
 new contexts or replace the least-recently-used slot; replacement increments the
 generation so delayed updates cannot be committed to a different context that
